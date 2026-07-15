@@ -48,6 +48,28 @@ Project links:
 - a working `agy` binary available in `PATH`, or passed explicitly with `--agy-binary`
 - a terminal if you want to use `login` or the full-screen dashboard
 
+Windows is supported as a draft platform. Install the native Antigravity CLI
+first from PowerShell:
+
+```powershell
+irm https://antigravity.google/cli/install.ps1 | iex
+agy --version
+```
+
+Then create and activate the manager environment:
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+py -m pip install --upgrade pip
+py -m pip install .
+```
+
+The Windows build installs `windows-curses` automatically for the dashboard.
+Manager state defaults to `%USERPROFILE%\.agy-cli-manager`, and the live
+profile defaults to `%USERPROFILE%\.gemini`. Use `--root` and `set-live-dir`
+to choose different locations.
+
 ## Install
 
 From a GitHub release wheel:

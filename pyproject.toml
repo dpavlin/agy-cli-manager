@@ -11,7 +11,9 @@ readme = "README.md"
 authors = [
   { name = "zcop" }
 ]
-dependencies = []
+dependencies = [
+  "windows-curses; sys_platform == 'win32'",
+]
 
 [project.scripts]
 agy-cli-manager = "agy_cli_manager.cli:main"

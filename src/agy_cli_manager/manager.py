@@ -18,7 +18,10 @@ import math
 from pathlib import Path
 from contextlib import contextmanager
 
-import fcntl
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 
 MANAGED_PROFILE_FILES = (
@@ -164,7 +167,16 @@ def ensure_layout(paths: ManagerPaths) -> None:
 def manager_lock(paths: ManagerPaths):
     ensure_layout(paths)
     with paths.lock_file.open("a+", encoding="utf-8") as f:
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        if os.name == "nt":
+            # msvcrt.locking() requires an existing byte at the current
+            # position and locks a byte range rather than the whole file.
+            f.seek(0)
+            f.write("0")
+            f.flush()
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
         try:
             f.seek(0)
             f.truncate()
@@ -174,9 +186,19 @@ def manager_lock(paths: ManagerPaths):
         finally:
             try:
                 f.seek(0)
-                f.truncate()
+                if os.name == "nt":
+                    # Keep the locked byte present until msvcrt releases it.
+                    f.write("0")
+                    f.truncate(1)
+                    f.flush()
+                else:
+                    f.truncate()
             finally:
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                if os.name == "nt":
+                    f.seek(0)
+                    msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 
 def load_state(paths: ManagerPaths) -> dict:
@@ -409,13 +431,31 @@ def resolve_agy_binary(agy_binary: str | None = None) -> str:
     if path_binary:
         return path_binary
 
-    install_sibling = Path(__file__).resolve().parents[3] / "agy"
-    if install_sibling.is_file() and os.access(install_sibling, os.X_OK):
-        return str(install_sibling)
+    install_root = Path(__file__).resolve().parents[3]
+    sibling_names = ("agy.exe", "agy") if os.name == "nt" else ("agy",)
+    for sibling_name in sibling_names:
+        install_sibling = install_root / sibling_name
+        if install_sibling.is_file() and os.access(install_sibling, os.X_OK):
+            return str(install_sibling)
 
     raise ValueError(
         "agy binary not found. Use --agy-binary, set AGY_BINARY, or put `agy` in PATH."
     )
+
+
+def _agy_subprocess_env(home_root: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    env["HOME"] = str(home_root)
+    if os.name == "nt":
+        # Windows-native tools resolve the home directory from USERPROFILE.
+        home_text = str(home_root)
+        drive, tail = os.path.splitdrive(home_text)
+        env["USERPROFILE"] = home_text
+        if drive:
+            env["HOMEDRIVE"] = drive
+            env["HOMEPATH"] = tail or "\\"
+    env["PATH"] = env.get("PATH", os.defpath)
+    return env
 
 
 def _copy_managed_profile_files(source: Path, target: Path) -> None:
@@ -685,9 +725,7 @@ def _google_userinfo_request(access_token: str) -> dict:
 
 def _run_agy_warmup(home_root: Path, agy_binary: str | None, timeout_seconds: int) -> None:
     resolved_binary = resolve_agy_binary(agy_binary)
-    env = os.environ.copy()
-    env["HOME"] = str(home_root)
-    env["PATH"] = env.get("PATH", "/bin:/usr/bin:/usr/local/bin")
+    env = _agy_subprocess_env(home_root)
     proc = subprocess.run(
         [
             resolved_binary,
@@ -777,9 +815,7 @@ def _run_agy_models_command(
     timeout_seconds: int = 30,
 ) -> list[dict]:
     resolved_binary = resolve_agy_binary(agy_binary)
-    env = os.environ.copy()
-    env["HOME"] = str(runtime_home)
-    env["PATH"] = env.get("PATH", "/bin:/usr/bin:/usr/local/bin")
+    env = _agy_subprocess_env(runtime_home)
     proc = subprocess.run(
         [resolved_binary, "models"],
         cwd=runtime_home,
@@ -1560,9 +1596,23 @@ def normalize_account_storage_name(value: str) -> str:
     cleaned = value.strip().replace("/", "_").replace("\\", "_")
     cleaned = " ".join(cleaned.split())
     if not cleaned:
-        raise ValueError("Detected account name is empty.")
+        raise ValueError("Account name is empty.")
     if cleaned in {".", ".."}:
-        raise ValueError("Detected account name is not usable as a storage path.")
+        raise ValueError("Account name is not usable as a storage path.")
+    if os.name == "nt":
+        if any(char in cleaned for char in '<>:"|?*') or any(ord(char) < 32 for char in cleaned):
+            raise ValueError("Account name contains characters that are invalid on Windows.")
+        if cleaned.endswith((".", " ")):
+            raise ValueError("Account name cannot end with a period or space on Windows.")
+        if cleaned.split(".", 1)[0].upper() in {
+            "CON",
+            "PRN",
+            "AUX",
+            "NUL",
+            *(f"COM{index}" for index in range(1, 10)),
+            *(f"LPT{index}" for index in range(1, 10)),
+        }:
+            raise ValueError("Account name is reserved by Windows.")
     return cleaned
 
 
@@ -1635,9 +1685,7 @@ def probe_profile_identity_via_usage(
         try:
             _copy_account_profile(source_home, runtime_home)
 
-            env = os.environ.copy()
-            env["HOME"] = str(runtime_home)
-            env["PATH"] = env.get("PATH", "/bin:/usr/bin:/usr/local/bin")
+            env = _agy_subprocess_env(runtime_home)
 
             proc = subprocess.run(
                 [resolved_binary, "-p", "/usage"],
@@ -2513,9 +2561,7 @@ def login_account(
     runtime_home.mkdir(parents=True, exist_ok=True)
     _remove_managed_profile_files(live_dir)
 
-    env = os.environ.copy()
-    env["HOME"] = str(runtime_home)
-    env["PATH"] = env.get("PATH", "/bin:/usr/bin:/usr/local/bin")
+    env = _agy_subprocess_env(runtime_home)
     try:
         proc = subprocess.Popen(
             [resolved_binary],
