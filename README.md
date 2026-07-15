@@ -73,6 +73,16 @@ Manager state defaults to `%USERPROFILE%\.agy-cli-manager`, and the live
 profile defaults to `%USERPROFILE%\.gemini`. Use `--root` and `set-live-dir`
 to choose different locations.
 
+On Windows, `agy` authentication is stored in Windows Credential Manager.
+After signing in with `agy`, use `import-current` to save that credential as a
+managed account:
+
+```powershell
+.\.venv\Scripts\agy-cli-manager.exe import-current profile-one
+.\.venv\Scripts\agy-cli-manager.exe import-current profile-two
+.\.venv\Scripts\agy-cli-manager.exe switch profile-one
+```
+
 ## Install
 
 From a GitHub release wheel:

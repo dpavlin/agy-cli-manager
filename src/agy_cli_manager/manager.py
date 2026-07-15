@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import ctypes
 import json
 import os
 import re
@@ -27,6 +28,9 @@ else:
 MANAGED_PROFILE_FILES = (
     "antigravity-cli/antigravity-oauth-token",
 )
+WINDOWS_ACTIVE_CREDENTIAL_TARGET = "gemini:antigravity"
+WINDOWS_CREDENTIAL_MARKER = "antigravity-cli/agy-cli-manager-credential"
+WINDOWS_CREDENTIAL_PREFIX = "agy-cli-manager:"
 LOGIN_ARTIFACT_SETS = (
     ("antigravity-cli/antigravity-oauth-token",),
 )
@@ -48,6 +52,105 @@ CODE_ASSIST_LOAD_PATH = "/v1internal:loadCodeAssist"
 CODE_ASSIST_QUOTA_PATH = "/v1internal:retrieveUserQuota"
 CODE_ASSIST_QUOTA_SUMMARY_PATH = "/v1internal:retrieveUserQuotaSummary"
 GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo"
+
+
+if os.name == "nt":
+    class _WindowsCredential(ctypes.Structure):
+        _fields_ = [
+            ("flags", ctypes.c_uint32),
+            ("credential_type", ctypes.c_uint32),
+            ("target_name", ctypes.c_wchar_p),
+            ("comment", ctypes.c_wchar_p),
+            ("last_written", ctypes.c_byte * 8),
+            ("credential_blob_size", ctypes.c_uint32),
+            ("credential_blob", ctypes.POINTER(ctypes.c_ubyte)),
+            ("persist", ctypes.c_uint32),
+            ("attribute_count", ctypes.c_uint32),
+            ("attributes", ctypes.c_void_p),
+            ("target_alias", ctypes.c_wchar_p),
+            ("user_name", ctypes.c_wchar_p),
+        ]
+
+    _ADVAPI32 = ctypes.WinDLL("Advapi32.dll", use_last_error=True)
+    _ADVAPI32.CredReadW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p)]
+    _ADVAPI32.CredReadW.restype = ctypes.c_bool
+    _ADVAPI32.CredWriteW.argtypes = [ctypes.POINTER(_WindowsCredential), ctypes.c_uint32]
+    _ADVAPI32.CredWriteW.restype = ctypes.c_bool
+    _ADVAPI32.CredFree.argtypes = [ctypes.c_void_p]
+    _ADVAPI32.CredFree.restype = ctypes.c_bool
+
+
+def _windows_credential_target(account_name: str) -> str:
+    return WINDOWS_CREDENTIAL_PREFIX + account_name
+
+
+def _windows_read_credential(target: str) -> tuple[bytes, str | None] | None:
+    if os.name != "nt":
+        return None
+    credential_ptr = ctypes.c_void_p()
+    if not _ADVAPI32.CredReadW(target, 1, 0, ctypes.byref(credential_ptr)):
+        return None
+    try:
+        credential = ctypes.cast(credential_ptr, ctypes.POINTER(_WindowsCredential)).contents
+        blob = ctypes.string_at(credential.credential_blob, credential.credential_blob_size)
+        return blob, credential.user_name
+    finally:
+        _ADVAPI32.CredFree(credential_ptr)
+
+
+def _windows_write_credential(target: str, blob: bytes, user_name: str | None) -> None:
+    if os.name != "nt":
+        return
+    blob_buffer = ctypes.create_string_buffer(blob)
+    credential = _WindowsCredential()
+    credential.credential_type = 1  # CRED_TYPE_GENERIC
+    credential.target_name = target
+    credential.credential_blob_size = len(blob)
+    credential.credential_blob = ctypes.cast(blob_buffer, ctypes.POINTER(ctypes.c_ubyte))
+    credential.persist = 2  # CRED_PERSIST_LOCAL_MACHINE
+    credential.user_name = user_name or "antigravity"
+    if not _ADVAPI32.CredWriteW(ctypes.byref(credential), 0):
+        error_code = ctypes.get_last_error()
+        raise OSError(error_code, f"Windows Credential Manager write failed for {target}")
+
+
+def _windows_capture_active_credential(account_name: str) -> bool:
+    credential = _windows_read_credential(WINDOWS_ACTIVE_CREDENTIAL_TARGET)
+    if credential is None:
+        return False
+    blob, user_name = credential
+    _windows_write_credential(_windows_credential_target(account_name), blob, user_name)
+    return True
+
+
+def _windows_activate_credential(account_name: str) -> bool:
+    credential = _windows_read_credential(_windows_credential_target(account_name))
+    if credential is None:
+        return False
+    blob, user_name = credential
+    _windows_write_credential(WINDOWS_ACTIVE_CREDENTIAL_TARGET, blob, user_name)
+    return True
+
+
+def _windows_active_credential_exists() -> bool:
+    return os.name == "nt" and _windows_read_credential(WINDOWS_ACTIVE_CREDENTIAL_TARGET) is not None
+
+
+def _windows_profile_marker(profile_dir: Path) -> Path:
+    return profile_dir / WINDOWS_CREDENTIAL_MARKER
+
+
+def _windows_profile_has_credential(profile_dir: Path) -> bool:
+    if os.name != "nt":
+        return False
+    marker = _windows_profile_marker(profile_dir)
+    if not marker.is_file():
+        return False
+    try:
+        target = marker.read_text(encoding="utf-8").strip()
+    except OSError:
+        return False
+    return bool(target and _windows_read_credential(target) is not None)
 
 
 @dataclass
@@ -1753,7 +1856,7 @@ def profile_has_login_artifacts(profile_dir: Path) -> bool:
     return any(
         all((profile_dir / name).is_file() for name in artifact_set)
         for artifact_set in LOGIN_ARTIFACT_SETS
-    )
+    ) or _windows_profile_has_credential(profile_dir)
 
 
 def _derive_health_status(paths: ManagerPaths, name: str, meta: dict) -> str:
@@ -1934,7 +2037,13 @@ def sync_state_from_disk(paths: ManagerPaths, state: dict) -> dict:
     return state
 
 
-def save_account_profile(paths: ManagerPaths, name: str, source_dir: Path, overwrite: bool = False) -> None:
+def save_account_profile(
+    paths: ManagerPaths,
+    name: str,
+    source_dir: Path,
+    overwrite: bool = False,
+    capture_windows_credential: bool = False,
+) -> None:
     if not name.strip():
         raise ValueError("Account name cannot be empty.")
     source_dir = source_dir.resolve()
@@ -1945,7 +2054,9 @@ def save_account_profile(paths: ManagerPaths, name: str, source_dir: Path, overw
     profile_source = _resolve_profile_source(source_dir)
     if not profile_source.exists() or not profile_source.is_dir():
         raise ValueError(f"Usable profile source not found in {source_dir}")
-    if not profile_has_login_artifacts(profile_source):
+    if not profile_has_login_artifacts(profile_source) and not (
+        capture_windows_credential and _windows_active_credential_exists()
+    ):
         raise ValueError(f"Profile source is missing required auth files: {profile_source}")
 
     target = account_dir(paths, name)
@@ -1957,6 +2068,12 @@ def save_account_profile(paths: ManagerPaths, name: str, source_dir: Path, overw
     else:
         target.mkdir(parents=True, exist_ok=False)
     _copy_account_profile(home_source, target)
+    if capture_windows_credential and os.name == "nt":
+        if not _windows_capture_active_credential(name):
+            raise ValueError("Windows agy credential was not found in Credential Manager.")
+        marker = _windows_profile_marker(target / ".gemini")
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(_windows_credential_target(name), encoding="utf-8")
     identity = _best_effort_saved_profile_identity(target)
 
     with manager_lock(paths):
@@ -2007,7 +2124,7 @@ def import_current(paths: ManagerPaths, name: str, source_dir: Path | None = Non
         live_dir = source_dir or get_live_dir(state)
         if live_dir is None:
             raise ValueError("No source_dir provided and no live_dir configured.")
-    add_account(paths, name, live_dir)
+    save_account_profile(paths, name, live_dir, capture_windows_credential=os.name == "nt")
 
 
 def _copy_active_runtime(paths: ManagerPaths, name: str) -> None:
@@ -2019,6 +2136,10 @@ def _copy_active_runtime(paths: ManagerPaths, name: str) -> None:
 
     paths.runtime_dir.mkdir(parents=True, exist_ok=True)
     _copy_account_profile(src, paths.runtime_dir)
+    if os.name == "nt":
+        marker = _windows_profile_marker(_resolve_profile_source(src))
+        if not marker.is_file() or not _windows_activate_credential(name):
+            raise ValueError(f"Account {name} is missing its Windows Credential Manager entry")
 
 
 def _sync_runtime_to_live_dir(paths: ManagerPaths, state: dict) -> None:
@@ -2611,7 +2732,9 @@ def login_account(
                 proc.kill()
         raise
 
-    if not live_dir.is_dir() or not profile_has_login_artifacts(live_dir):
+    if not live_dir.is_dir() or not (
+        profile_has_login_artifacts(live_dir) or _windows_active_credential_exists()
+    ):
         raise ValueError("agy login did not produce a usable auth profile.")
 
     identity = resolve_login_profile_identity(live_dir, agy_binary=resolved_binary, live_dir=live_dir)
@@ -2634,7 +2757,13 @@ def login_account(
         else:
             overwrite = True
 
-    save_account_profile(paths, storage_name, runtime_home, overwrite=overwrite)
+    save_account_profile(
+        paths,
+        storage_name,
+        runtime_home,
+        overwrite=overwrite,
+        capture_windows_credential=os.name == "nt",
+    )
     return storage_name
 
 
