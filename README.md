@@ -56,6 +56,9 @@ irm https://antigravity.google/cli/install.ps1 | iex
 agy --version
 ```
 
+If `agy` is not already on `PATH`, the manager also checks the standard
+Windows install location `%LOCALAPPDATA%\agy\bin\agy.exe`.
+
 Then create and activate the manager environment:
 
 ```powershell

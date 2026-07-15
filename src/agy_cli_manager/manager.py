@@ -131,6 +131,10 @@ def default_live_dir() -> Path:
     env_live_dir = os.getenv("AGY_MANAGER_LIVE_DIR", "").strip()
     if env_live_dir:
         return Path(env_live_dir).expanduser()
+    if os.name == "nt":
+        windows_home = os.getenv("USERPROFILE", "").strip()
+        if windows_home:
+            return Path(windows_home) / ".gemini"
     return Path.home() / ".gemini"
 
 
@@ -430,6 +434,13 @@ def resolve_agy_binary(agy_binary: str | None = None) -> str:
     path_binary = shutil.which("agy")
     if path_binary:
         return path_binary
+
+    if os.name == "nt":
+        local_app_data = os.getenv("LOCALAPPDATA", "").strip()
+        if local_app_data:
+            windows_binary = Path(local_app_data) / "agy" / "bin" / "agy.exe"
+            if windows_binary.is_file():
+                return str(windows_binary)
 
     install_root = Path(__file__).resolve().parents[3]
     sibling_names = ("agy.exe", "agy") if os.name == "nt" else ("agy",)
