@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.3.0.dev1 - Windows draft
+
+- add Windows file locking and native `agy.exe` discovery
+- add Windows home-directory environment handling for isolated profiles
+- add Windows-safe account-name validation
+- install `windows-curses` automatically on Windows
+
 ## v0.2.1 - 2026-07-15
 
 - preserve the explicit profile name supplied during login
